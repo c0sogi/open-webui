@@ -26,12 +26,15 @@ def _print_with_time(msg: str) -> None:
 def _get_token_count(model: str) -> Callable[[str], int]:
     # Get the token count function for the model, or a rough estimate if not available
     try:
-        return lambda text: len(tiktoken.encoding_for_model(model).encode(text))
+        func = tiktoken.encoding_for_model(model)
+        return lambda text: len(func.encode(text))
     except Exception as e:
         log.exception(e)
 
     try:
-        return lambda text: len(tiktoken.get_encoding("cl100k_base").encode(text))
+        func: tiktoken.Encoding = tiktoken.get_encoding("cl100k_base")
+        return lambda text: len(func.encode(text))
+
     except Exception as e:
         log.exception(e)
 
@@ -59,6 +62,39 @@ def _request_iterator(
                 "url": "/v1/embeddings",
                 "body": EmbeddingCreateParams(model=model, input=texts),
             }).encode()
+        )
+
+
+def _batch_iterator(
+    texts: list[str], model: str, uuid: str, token_limit: int, chunk_size: int = 2048
+) -> Iterable[tuple[int, bytes]]:
+    current_request: list[str] = []
+    current_tokens = 0
+    batch_idx: int = 0
+    text2tokens: Callable[[str], int] = _get_token_count(model)
+    for text in texts:
+        tokens: int = text2tokens(text)
+        if current_tokens + tokens > token_limit:
+            yield (
+                batch_idx,
+                b"\n".join(
+                    _request_iterator(
+                        current_request, model, uuid, batch_idx, chunk_size
+                    )
+                ),
+            )
+            batch_idx += 1
+            current_request = [text]
+            current_tokens = tokens
+        else:
+            current_request.append(text)
+            current_tokens += tokens
+    if current_request:
+        yield (
+            batch_idx,
+            b"\n".join(
+                _request_iterator(current_request, model, uuid, batch_idx, chunk_size)
+            ),
         )
 
 
@@ -119,39 +155,6 @@ def _process_one_batch(
         raise
 
 
-def _batch_iterator(
-    texts: list[str], model: str, uuid: str, token_limit: int, chunk_size: int = 2048
-) -> Iterable[tuple[int, bytes]]:
-    current_request: list[str] = []
-    current_tokens = 0
-    batch_idx: int = 0
-    text2tokens: Callable[[str], int] = _get_token_count(model)
-    for text in texts:
-        tokens: int = text2tokens(text)
-        if current_tokens + tokens > token_limit:
-            yield (
-                batch_idx,
-                b"\n".join(
-                    _request_iterator(
-                        current_request, model, uuid, batch_idx, chunk_size
-                    )
-                ),
-            )
-            batch_idx += 1
-            current_request = [text]
-            current_tokens = tokens
-        else:
-            current_request.append(text)
-            current_tokens += tokens
-    if current_request:
-        yield (
-            batch_idx,
-            b"\n".join(
-                _request_iterator(current_request, model, uuid, batch_idx, chunk_size)
-            ),
-        )
-
-
 def _request_async_embedding(
     model: str,
     texts: list[str],
@@ -202,12 +205,10 @@ def generate_openai_batch_embeddings(
         )
         if text_length < 500_000:
             log.info("Using single processing for OpenAI embeddings")
-            func = _request_sync_embedding
             return _request_sync_embedding(url, key, texts, model)
         else:
             log.info("Using batch processing for OpenAI embeddings")
-            func = _request_async_embedding
-        return func(model, texts, key, url)
+            return _request_async_embedding(model, texts, key, url)
 
     except Exception as e:
         log.exception(e)
